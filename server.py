@@ -1,273 +1,317 @@
-import socket
-from threading import Thread, Lock
-import string
-import random
-import time
-import json
-import sys
+import socket, threading, string, random, json, logging, time
 
-userPWMutex = Lock()
-groupsMutex = Lock()
-messagesMutex = Lock()
+logger = logging.getLogger() # Custom logging
+logger.setLevel(logging.DEBUG)
+handler = logging.StreamHandler()
+formatter = logging.Formatter('[%(asctime)s:%(levelname)s] [%(threadName)s]: %(message)s', datefmt='%I:%M:%S')
+handler.setFormatter(formatter)
+logger.addHandler(handler)
 
-def handleLogin(connection):
-    with open('userPW.json') as json_file:
-        userPW = json.load(json_file)
+userPWMutex = threading.Lock() # Every time something has to be written to a file, a mutex is needed to accomodate different threads
+groupsMutex = threading.Lock()
+messagesMutex = threading.Lock()
+keyMutex = threading.Lock()
 
-    while True:
-        username = connection.recv(2048)
-        if username:
-            username = username.decode()
-            if username == '5':
-                print('Received exit, returning')
-                return
-            break
+def handleLogin(connection, address):
+    try:
+        data = receiveResponse(connection)
+        data = json.loads(data)
+    except Exception as e:
+        logging.warning(f'No login values detected {str(e)}')
+        return
+    
+    username = data.get("username")
+    password = data.get("password")
 
-    while True:
-        password = connection.recv(2048)
-        if password:
-            password = password.decode()
-            break
+    threading.current_thread().name = f'{address[0]}:{address[1]}|{username}'
 
-    if username not in userPW:
-        userPWMutex.acquire()
+    userPWMutex.acquire()
+    userPW = getUserPW()
 
-        with open('userPW.json') as json_file:
-            userPW = json.load(json_file)
-
+    if username not in userPW: # Makes a new user for every username that does not exist
         userPW[username] = password
-        
-        with open('userPW.json', 'w') as outfile:
-            json.dump(userPW, outfile)
+        writeUserPW(userPW)
 
-        userPWMutex.release()
+        logging.info('Registered: ' + username)
+        sendNew(connection)
 
-        connection.send(str.encode('200')) 
-        print('Registered : ', username)
-        print("{:<8} {:<20}".format('USER', 'PASSWORD'))
-        for k, v in userPW.items():
-            label, num = k,v
-            print("{:<8} {:<20}".format(label, num))
+        data = receiveResponse(connection)
+        data = json.loads(data)
+        publicKey = data.get("publicKey")
+
+        keyMutex.acquire()
+
+        publicKeys = getPublicKeys()
+        publicKeys[username] = publicKey
+        writePublicKeys(publicKeys)
+
+        keyMutex.release()
+
+        sendSuccess(connection)
     else:
-        # If already existing user, check if the entered password is correct
-        if userPW[username] != password:
-            connection.send(str.encode('400')) # Response code for login failed
-            print('Login Failed : ', username)
-            connection.close()
-            return
+        if userPW[username] != password: # If the password of the user is not correct
+            userPWMutex.release()
+            logging.info('Login Failed: ' + username)
+            sendFailure(connection)
+            handleLogin(connection, address)
         
-        connection.send(str.encode('200')) # Response Code for successfully logged in
-        print('Connected : ', username)
+        logging.info('Logged In: ' + username) # User is logged in
+        sendSuccess(connection)
+    
+    userPWMutex.release()
 
     handleMessages(connection, username)
 
-def makeNewGroup(user1, user2):
-    newGroupName = ''.join(random.SystemRandom().choice(string.ascii_uppercase + string.digits) for _ in range(20)) # for new group names
-                
-    groupsMutex.acquire()
-
-    with open('groups.json') as json_file:
-        groups = json.load(json_file)
-
-    groups[newGroupName] = [user1, user2]
-
-    with open('groups.json', 'w') as outfile:
-        json.dump(groups, outfile)
-
-    groupsMutex.release()
-
-    messagesMutex.acquire()
-
-    with open('messages.json') as json_file:
-        messages = json.load(json_file)
-
-    messages[newGroupName] = {'messages': []}
-
-    with open('message.json', 'w') as outfile:
-        json.dump(messages, outfile)
-
-    messagesMutex.release()
-
-def getGroup(user1, user2):
-    with open('groups.json') as json_file:
-        groups = json.load(json_file)
-
-    for group in groups:
-        if groups[group].contains(user1) and groups[group].contains(user2):
-            return group
-
-    return None
-
 def handleMessages(connection, username):
     while True:
-        while True:
-            method = connection.recv(2048)
-            if method:
-                break
+        method = receiveResponse(connection)
 
-        method = method.decode()
-        print('method is ' + method)
-        connection.send(str.encode('1'))
+        if method == "":
+            logging.warning('Connection closed, returning')
+            return
 
-        if method == '1': # send all groups
-            with open('groups.json') as json_file:
-                groups = json.load(json_file)
+        logging.info(f'Method: {method}')
+
+        try:
+            connection.send(str.encode('1')) # Send ack
+        except Exception as e:
+            logging.error(str(e))
+            return
+
+        if method == '3': # Returns all available users that the crnt user can send messages to
+            userPW = getUserPW()
+            recipients = []
+            
+            for user in userPW:
+                if user == username: # User cannot send messages to itself
+                    continue
+                
+                recipients.append(user)
+
+            data = json.dumps({"recipients": recipients})
+            connection.send(data.encode())
+
+        elif method == '4': # send all historical messaging groups 
+            groups = getGroups()
+            groupsArray = []
 
             for key in groups:
                 if username in groups[key]:
-                    receiverArray = groups[key][:]
-                    receiverArray.remove(username)
+                    recipientArray = groups[key][:]
+                    recipientArray.remove(username) # Removes crnt user's own username
+                    groupsArray.append({"recipient": recipientArray[0]})
 
-                    connection.send(str.encode(key))
-                    connection.send(str.encode(receiverArray[0]))
-
-            connection.send(str.encode('end'))
-
-        elif method == '2': # Send group history
-            user = connection.recv(2048) # Group that the user selected
-            iteration = connection.recv(2048) # Number of times that the user has seen 10 messages
-            user = user.decode()
-            iteration = iteration.decode()
+            data = json.dumps({"groups": groupsArray})
+            connection.send(data.encode())
             
-            group = getGroup(user, username)
-            count = 0
+        elif method == '5': # Send message
+            data = receiveResponse(connection)
+            data = json.loads(data)
+            recipient = data.get("recipient")
 
-            with open('messages.json') as json_file:
-                messages = json.load(json_file)
+            if verifyUser(recipient) is False: # Checks if the requested recipient exists
+                sendNotExist(connection)
+                continue
 
-            i = len(messages[group][message]) - 1
+            if username == recipient: # User cannot send messages to itself
+                sendForbidden(connection)
+                continue
 
-            while i >= 0:
-                i -= 1
-                count += 1
+            publicKeys = getPublicKeys()
 
-                if count < 10 * iteration: # Skips all messages until the next ten
-                    continue
-                elif count == 10 * iteration + 10: # Only sends 10 messages at a time
-                    break
+            if recipient not in publicKeys: # Checks if recipient public key exists
+                sendNotExist(connection)
+                continue
+            
+            data = json.dumps({"publicKey": publicKeys[recipient]})
+            connection.send(data.encode())
 
-                m = messages[group][message][i]
+            group = getAvailableGroups(username, recipient)
 
-                connection.send(str.encode(m['sentAt']))
-                connection.send(str.encode(m['sentBy']))
-                connection.send(str.encode(m['messageText']))
-                
-            connection.send(str.encode('end'))
+            if group is None: # Checks if there has been messages history between both users
+                group = makeNewGroup(username, recipient) # If not, creates a new message group
 
-        elif method == '3': # Send message
-            receiver = connection.recv(2048)
-            message = connection.recv(2048)
-            receiver = receiver.decode()
-            message = message.decode()
-
-            group = getGroup(username, receiver)
-
-            if not group:
-                group = makeNewGroup(username, receiver)
+            message = connection.recv(4096)
 
             messagesMutex.acquire()
 
-            with open('messages.json') as json_file:
-                messages = json.load(json_file)
-
-            messages[group]['messages'].append({'sendAt': int(time.time()), 'sentBy': username, 'messageText': message})
-
-            with open('message.json', 'w') as outfile:
-                json.dump(messages, outfile)
+            messages = getMessages()
+            messages[group]['messages'].append(json.dumps({"sentAt": int(time.time()), "sentBy": username, "message": list(message)})) # Writes the new messsage to the messages file
+            writeMessages(messages)
 
             messagesMutex.release()
 
-        elif method == '4': # Returns all available users that the crnt user can send messages to
-            with open('userPW.json') as json_file:
-                userPW = json.load(json_file)
-            
-            for user in userPW:
-                if user == username:
-                    continue
+            sendSuccess(connection)
+
+        elif method == '6': # Send message history
+            data = receiveResponse(connection)
+
+            data = json.loads(data)
+            recipient = data.get("recipient")
+            iteration = data.get("iteration") # Number of times that the user has seen 10 messages
+
+            if verifyUser(recipient) is False: # Checks if the requested recipient exists
+                sendNotExist(connection)
+                continue
+
+            if username == recipient: # Cannot see message history of yourself
+                sendForbidden(connection)
+                continue
+
+            group = getAvailableGroups(recipient, username)
+
+            if group is None: # Checks if message history exists between crnt user and recipient
+                sendFailure(connection)
+                continue
+
+            messages = getMessages()
+
+            i = len(messages[group]['messages']) - (10 * (iteration - 1)) - 1 # To find the next 10 messages that the user requested
+            messageArray = []
+            count = 0
+
+            while i >= 0:
+                messageArray.append(messages[group]['messages'][i])
+
+                count += 1
+                i -= 1
+
+                if count == 10: # Only sends 10 messages at a time
+                    break
+
+            if i < 0: # Detects if all messages have been sent to the user
+                end = True
+            else:
+                end = False
+
+            data = json.dumps({"messages": messageArray, "end": end})
+            connection.send(data.encode())
                 
-                connection.send(str.encode(user))
-
-            connection.send(str.encode('end'))
-
-        elif method == '5': # Disconnect
-            print('disconnected')
+        elif method == '9': # Disconnect
+            logging.info('Disconnected')
             connection.close()
             return
 
 def main():
     ServerSocket = socket.socket(family = socket.AF_INET, type = socket.SOCK_STREAM)
 
-    if len(sys.argv) != 3:
-        sys.exit('Incorrect number of arguments, please provide a host and port number')
+    with open('config.json') as json_file:
+        config = json.load(json_file)
 
-    host = str(sys.argv[1])
-    port = int(sys.argv[2])
+    host = config['host']
+    port = config['port']
 
     try:
         ServerSocket.bind((host, port))
-    except socket.error as e:
-        print(str(e))
+    except Exception as e:
+        logging.error(str(e))
+        if str(e) == '[Errno 98] Address already in use':
+            config['port'] = config['port'] + 1
+            with open('config.json', 'w') as outfile:
+                json.dump(config, outfile)
+            logging.info('Port number increased by one')
+        return
 
-    print('Waiting for a Connection ...')
-    ServerSocket.listen(5)
+    logging.info('Waiting for a Connection ...')
+    ServerSocket.listen()
 
     while True:
         try:
             Client, address = ServerSocket.accept()
-            print('Connected to: ' + address[0] + ':' + str(address[1]))
-            client_handler = Thread(target = handleLogin, args = (Client,))
-            client_handler.start()
-            client_handler.join()
-        except socket.error as e:
-            print(str(e))
+            logging.info(f'Connected to: {address[0]}:{address[1]}')
+            clientThread = threading.Thread(target = handleLogin, args = (Client, address))
+            clientThread.start()
+        except Exception as e:
+            logging.info(str(e))
+
+def sendSuccess(connection):
+    connection.send(str.encode('200'))
+
+def sendNew(connection):
+    connection.send(str.encode('201'))
+
+def sendFailure(connection):
+    connection.send(str.encode('400'))
+
+def sendNotExist(connection):
+    connection.send(str.encode('404'))
+
+def sendForbidden(connection):
+    connection.send(str.encode('403'))
+
+def getMessages():
+    with open('messages.json') as json_file:
+        return json.load(json_file)
+
+def getGroups():
+    with open('groups.json') as json_file:
+        return json.load(json_file)
+
+def getUserPW():
+    with open('userPW.json') as json_file:
+        return json.load(json_file)
+
+def getPublicKeys():
+    with open('publicKeys.json') as json_file:
+        return json.load(json_file)
+
+def writeMessages(messages):
+    with open('messages.json', 'w') as outfile:
+        json.dump(messages, outfile)
+
+def writeGroups(groups):
+    with open('groups.json', 'w') as outfile:
+        json.dump(groups, outfile)
+
+def writeUserPW(userPW):
+    with open('userPW.json', 'w') as outfile:
+        json.dump(userPW, outfile)
+
+def writePublicKeys(publicKeys):
+    with open('publicKeys.json', 'w') as outfile:
+        json.dump(publicKeys, outfile)
+
+def receiveResponse(connection):
+    response = connection.recv(2048)
+    return response.decode()
+
+def verifyUser(user):
+    userPW = getUserPW()
+
+    if user not in userPW:
+        return False
+    else:
+        return True
+
+def getAvailableGroups(user1, user2):
+    groups = getGroups()
+
+    for group in groups:
+        if user1 in groups[group] and user2 in groups[group]:
+            return group
+
+    return None
+
+def makeNewGroup(user1, user2):
+    newGroupName = ''.join(random.SystemRandom().choice(string.ascii_uppercase + string.digits) for _ in range(20)) # for new group names
+    
+    groupsMutex.acquire()
+
+    groups = getGroups()
+    groups[newGroupName] = [user1, user2]
+    writeGroups(groups)
+
+    groupsMutex.release()
+
+    messagesMutex.acquire()
+
+    messages = getMessages()
+    messages[newGroupName] = {'messages': []}
+    writeMessages(messages)
+
+    messagesMutex.release()
+
+    return newGroupName
 
 if __name__ == "__main__":
     main()
-    
-# userPW = {
-#     'username': 'PW',
-#     'username': 'PW'
-# }
-
-# groups = {
-#     {
-#         'hsduiofhsdjiof': [
-#             'user',
-#             'user'
-#         ],
-#         'shdifodjs': [
-#             'user',
-#             'user'
-#         ]
-#     }
-# }
-
-# messages = {
-#     {
-#         'hsduiofhsdjiof': {
-#             'messages': [
-#                 {
-#                     'sentAt': '...',    
-#                     'sentBy': '...',
-#                     'messageText': '...'
-#                 },
-#                 {
-#                     'sentAt': '...',    
-#                     'sentBy': '...',
-#                     'messageText': '...'
-#                 }
-                
-#             ]
-#         },
-#         'shdifodjs': {
-#             'messages': [
-#                 {
-#                     'sentAt': '...',
-#                     'sentBy': '...',
-#                     'messageText': '...'
-#                 }
-                
-#             ]
-#         }
-#     }
-# }
