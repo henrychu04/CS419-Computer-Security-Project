@@ -2,10 +2,12 @@
 
 A secure cli messaging application using RSA encryption to send and receive messages
 
+**_Project coded and tested on Linux. It has not been tested on Windows or Mac_**
+
 ## Installation
 
 ```bash
-pip install -r requirements.txt
+pip3 install -r requirements.txt
 ```
 
 ## Usage
